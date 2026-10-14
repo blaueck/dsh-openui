@@ -3,6 +3,11 @@
   "description": "DSH OpenUI plugin: the `openui` tool and its bundled skill let the model answer with OpenUI Lang \u2014 the Open Standard for Generative UI \u2014 rendered as a live, interactive, sandboxed card in the conversation, built from the official 84-component chat library shipped by @openuidev/browser-bundle.",
   "version": "0.1.0",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/blaueck/dsh-openui.git"
+  },
+  "homepage": "https://github.com/blaueck/dsh-openui#readme",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
@@ -47,7 +52,8 @@
     "verify:frame": "node scripts/verify-frame.mjs",
     "verify:render": "node scripts/verify-render.mjs",
     "check": "pnpm run clean && pnpm run gen && pnpm run gen:typert && pnpm run typecheck && pnpm run test && tsdown && pnpm run smoke",
-    "smoke": "node scripts/smoke-plugin.mjs"
+    "smoke": "node scripts/smoke-plugin.mjs",
+    "prepublishOnly": "pnpm run check"
   },
   "dsh": {
     "bundle": {
@@ -73,7 +79,6 @@
   },
   "dependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.2.0-rc.2",
-    "@openuidev/lang-core": "^1.0.0",
     "zod": "^3.25.76"
   },
   "devDependencies": {
@@ -91,6 +96,7 @@
     "@deepseek-ai/dsh-tools": "0.2.0-rc.2",
     "@deepseek-ai/dsh-typert-generator": "0.2.0-rc.2",
     "@deepseek-ai/schemastery": "3.18.4",
+    "@openuidev/lang-core": "^1.0.0",
     "@openuidev/react-lang": "1.0.0",
     "@openuidev/react-ui": "0.18.0",
     "@types/node": "^22.0.0",
