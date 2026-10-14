@@ -1,0 +1,5 @@
+{
+  "extends": "./tsconfig.json",
+  "include": ["src/index.ts", "src/protocol.ts", "src/host", "src/library-spec.ts", "src/meta.ts", "src/skill.ts", "src/shell.ts", "src/frame-css.ts", "src/tool.ts"],
+  "exclude": ["src/client"]
+}
