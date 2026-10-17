@@ -10,6 +10,8 @@
  * @module @blaueck/dsh-openui/meta
  */
 
+import { parseComponentSnapshot, type CustomComponent } from './registry.ts'
+
 /**
  * Wire name of the tool and the key of the toolview that renders its cards.
  * Lives in this pure module so the browser half can import it without pulling
@@ -50,6 +52,15 @@ export interface OpenUiMeta {
   readTools: string[]
   /** Tool names the program passes to `Mutation()`, resolved the same way. */
   writeTools: string[]
+  /**
+   * Definitions of the registered components this card used, snapshotted at
+   * render time. Replay must not depend on the live registry: a component
+   * removed or edited later would otherwise rewrite a card already in the
+   * transcript. Absent for cards written before the feature, and for nested
+   * dispatches whose meta is rebuilt from arguments; the browser half then falls
+   * back to the registry it fetched.
+   */
+  components?: readonly CustomComponent[]
 }
 
 /**
@@ -70,6 +81,7 @@ export function openUiMetaFrom(meta: unknown): OpenUiMeta | undefined {
   if (typeof title !== 'string' || typeof path !== 'string' || typeof source !== 'string') return undefined
   if (source.trim().length === 0) return undefined
   if (mode !== 'inline' && mode !== 'wide') return undefined
+  const components = parseComponentSnapshot(record['components'])
   return {
     kind: 'openui',
     render: 'openui-lang',
@@ -80,6 +92,7 @@ export function openUiMetaFrom(meta: unknown): OpenUiMeta | undefined {
     libraryId: typeof libraryId === 'string' ? libraryId : '',
     readTools: nameList(record['readTools']),
     writeTools: nameList(record['writeTools']),
+    ...components === undefined ? {} : { components },
   }
 }
 

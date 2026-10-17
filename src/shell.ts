@@ -53,6 +53,13 @@ export const FRAME_READY = 'ready'
 export const FRAME_HEIGHT = 'height'
 export const FRAME_ACTION = 'action'
 export const FRAME_ERROR = 'error'
+/**
+ * Frame → parent: the renderer parsed the current program with no findings.
+ * This is what clears an error row a *previous* program state produced (for
+ * example a registered component call that was still unknown while the registry
+ * was being fetched), without re-pushing the program.
+ */
+export const FRAME_OK = 'ok'
 /** Frame → parent: one card-initiated tool call the parent must answer. */
 export const FRAME_TOOLCALL = 'toolcall'
 
@@ -105,6 +112,21 @@ export interface FrameSetMessage {
   readTools?: readonly string[]
   /** Tool names the program passes to `Mutation()`, resolved the same way. */
   writeTools?: readonly string[]
+  /**
+   * Names of the registered components this source was expanded with. While the
+   * program is still streaming, a half-written registered call parses as an
+   * unknown component; naming the registry lets the frame ignore exactly that
+   * transient finding instead of flashing a parse error under a card that is
+   * already painting.
+   */
+  knownComponents?: readonly string[]
+  /**
+   * Registered React components this program may call. The host has already
+   * validated their calls against an extended schema; the frame evaluates their
+   * code and extends its own library. Template components never appear here —
+   * the browser half expands them before posting.
+   */
+  customComponents?: readonly import('./registry.ts').CustomComponent[]
   /** Host palette overrides; omitted leaves the previous ones in place. */
   theme?: FrameThemeVars
   /** Appearance to declare to the frame, so native controls match. */
@@ -247,6 +269,9 @@ function frameScript(options: {
   // paths that have no host parse (a still-streaming call, a nested dispatch).
   var declaredRead = {};
   var declaredWrite = {};
+  // Registered component names, so a half-written call is not reported as an
+  // unknown component while the model is still streaming it.
+  var declaredKnown = {};
 
   /** Turn one arriving name list into a lookup object. */
   function nameSet(names) {
@@ -323,15 +348,198 @@ function frameScript(options: {
 
   var api = null;
   var root = null;
-  var current = { source: '', streaming: false };
+  var current = { source: '', streaming: false, customComponents: [] };
   var painted = false;
+
+  // ---- Registered React components ----------------------------------------
+  //
+  // The bundle exposes React, createRoot, Renderer and the chat library — not
+  // zod and not defineComponent. The library still grows at runtime:
+  // 'extend({ components: { add } })' returns a new library, and the Renderer
+  // parses with whatever library it is handed. Prop schemas are borrowed from
+  // the catalog's own components, which is why the zoo below probes existing
+  // definitions rather than constructing schemas. A component is added only
+  // when its schema and code both build; one bad registration cannot take down
+  // the built-in catalog.
+
+  /** The zod type tag of a schema, across the versions the bundle may carry. */
+  function zodType(schema) {
+    var def = schema && ((schema._zod && schema._zod.def) || schema._def);
+    return def && def.type;
+  }
+
+  /** Peel optional/default/nullable wrappers off a schema. */
+  function unwrapSchema(schema) {
+    var current = schema;
+    for (var i = 0; i < 6; i += 1) {
+      var type = zodType(current);
+      if (type !== 'optional' && type !== 'default' && type !== 'nullable' && type !== 'prefault') break;
+      if (typeof current.unwrap !== 'function') break;
+      try { current = current.unwrap(); } catch (error) { break; }
+    }
+    return current;
+  }
+
+  /** Read one prop schema from a catalog component, unwrapping object wrappers. */
+  function componentProp(library, componentName, propName) {
+    var definition = library.components[componentName];
+    var props = definition && definition.props;
+    var shape = props && props.shape;
+    return shape && shape[propName];
+  }
+
+  /** The schema zoo one library extension borrows from. */
+  function schemaZoo(library) {
+    var rules = componentProp(library, 'Input', 'rules');
+    var innerRules = unwrapSchema(rules);
+    var boolean = innerRules && innerRules.shape && innerRules.shape.required;
+    return {
+      string: componentProp(library, 'TextContent', 'text'),
+      number: componentProp(library, 'Slider', 'min'),
+      boolean: boolean,
+      // json, array, children, component and any all accept an open
+      // value. The host schema does the same: narrowing a child array to the
+      // built-in component union would reject a registered component inside it,
+      // and the global parser still resolves every component call anyway.
+      any: unwrapSchema(componentProp(library, 'Col', 'data'))
+    };
+  }
+
+  /** Build one declared prop's schema, honouring requiredness. */
+  function propSchemaOf(zoo, prop) {
+    var type = prop && prop.type;
+    var required = !!(prop && prop.required);
+    var schema;
+    if (type === 'string') schema = zoo.string;
+    else if (type === 'number') schema = zoo.number;
+    else if (type === 'boolean') schema = zoo.boolean;
+    else schema = zoo.any;
+    if (!schema) throw new Error('no catalog schema is available for prop type "' + type + '"');
+    if (required) {
+      if (typeof schema.nonoptional === 'function') return schema.nonoptional();
+      return schema;
+    }
+    if (typeof schema.optional === 'function') return schema.optional();
+    return schema;
+  }
+
+  /** Build the Zod object the runtime validates one custom component's props with. */
+  function buildProps(library, zoo, definition) {
+    var shape = {};
+    (definition.props || []).forEach(function (prop) {
+      shape[prop.name] = propSchemaOf(zoo, prop);
+    });
+    var empty = library.components.TextContent.props.pick({});
+    return empty.extend(shape);
+  }
+
+  /** Compile one component source. Compiling does not run the body. */
+  function evaluateComponent(source) {
+    var factory = new Function('React', 'return (' + source + '\\n);');
+    var fn = factory(api.React);
+    if (typeof fn !== 'function') throw new Error('the code did not evaluate to a function');
+    return fn;
+  }
+
+  /** Inject one component's stylesheet once per frame. */
+  function injectComponentCss(name, css) {
+    if (typeof css !== 'string' || css.length === 0) return;
+    var id = 'openui-component-' + name;
+    if (document.getElementById(id)) return;
+    var style = document.createElement('style');
+    style.id = id;
+    style.textContent = css;
+    document.head.appendChild(style);
+  }
+
+  /** Wrap one component so a render error stays inside its own box. */
+  function wrapComponent(fn, name) {
+    return function (renderProps) {
+      try {
+        return fn(renderProps && renderProps.props ? renderProps.props : {}, renderProps);
+      } catch (error) {
+        var detail = error && error.message ? error.message : String(error);
+        return api.React.createElement(
+          'pre',
+          { style: { color: '#d33', whiteSpace: 'pre-wrap', fontSize: 12, margin: 0 } },
+          'OpenUI component "' + name + '" failed: ' + detail
+        );
+      }
+    };
+  }
+
+  /** Build one library with every usable registered component added. */
+  function buildLibrary(definitions) {
+    var base = api.openuiChatLibrary;
+    var zoo = schemaZoo(base);
+    var additions = [];
+    var problems = [];
+    definitions.forEach(function (definition) {
+      try {
+        if (!definition || typeof definition.name !== 'string' || typeof definition.code !== 'string') return;
+        var props = buildProps(base, zoo, definition);
+        var fn = evaluateComponent(definition.code);
+        injectComponentCss(definition.name, definition.css);
+        additions.push({
+          name: definition.name,
+          props: props,
+          description: typeof definition.description === 'string' ? definition.description : '',
+          component: wrapComponent(fn, definition.name),
+          ref: props
+        });
+      } catch (error) {
+        var label = definition && definition.name ? definition.name + ': ' : '';
+        problems.push(label + (error && error.message ? error.message : String(error)));
+      }
+    });
+    if (problems.length > 0) {
+      send('error', { message: 'registered component failed to load: ' + problems.join('; ') });
+    }
+    if (additions.length === 0) return base;
+    return base.extend({ components: { add: additions } });
+  }
+
+  var libraryCache = { key: '', library: null };
+  /** Memoize the extended library by the definitions that built it. */
+  function libraryFor(definitions) {
+    if (!definitions || !definitions.length) return api.openuiChatLibrary;
+    var key;
+    try { key = JSON.stringify(definitions); } catch (error) { return api.openuiChatLibrary; }
+    if (libraryCache.key === key && libraryCache.library) return libraryCache.library;
+    var library;
+    try {
+      library = buildLibrary(definitions);
+    } catch (error) {
+      send('error', { message: 'registered component failed to load: ' + (error && error.message ? error.message : String(error)) });
+      library = api.openuiChatLibrary;
+    }
+    libraryCache = { key: key, library: library };
+    return library;
+  }
+
+  // The only host-facing capability a registered component gets directly. It is
+  // the same continue_conversation action a catalog Button can carry, not a
+  // tool call: reads and writes still go through the gated program path.
+  window.__dshOpenUI = {
+    toAssistant: function (message) {
+      var text = typeof message === 'string' ? message : String(message === undefined ? '' : message);
+      if (text.length === 0) return;
+      send('action', {
+        event: normalizeAction({
+          type: 'continue_conversation',
+          params: { message: text },
+          humanFriendlyMessage: text
+        })
+      });
+    }
+  };
 
   /** Paint the current program state through the OpenUI renderer. */
   function render() {
     if (!api || !root) return;
     root.render(api.React.createElement(api.Renderer, {
       response: current.source,
-      library: api.openuiChatLibrary,
+      library: libraryFor(current.customComponents),
       isStreaming: current.streaming,
       // Queries and mutations reach the host through this provider. The
       // renderer accepts two shapes and tells them apart by probing for a
@@ -361,9 +569,21 @@ function frameScript(options: {
       onError: function (errors) {
         // The renderer reports an empty list on the first paint, before any
         // source has arrived. Relaying that would put a bogus parse failure
-        // under a card that renders perfectly.
-        if (!errors || !errors.length) return;
-        var text = formatErrors(errors);
+        // under a card that renders perfectly. Once a card has painted, an
+        // empty list means a previous finding is resolved, so it clears the
+        // row the parent is showing.
+        if (!errors || !errors.length) {
+          if (painted) send('ok', {});
+          return;
+        }
+        var list = errors;
+        if (current.streaming) {
+          list = errors.filter(function (error) {
+            return !(error && error.code === 'unknown-component' && declaredKnown[error.component] === true);
+          });
+          if (!list.length) return;
+        }
+        var text = formatErrors(list);
         send('error', { message: text });
         if (!painted) notice('OpenUI could not parse this program: ' + text);
       }
@@ -381,7 +601,12 @@ function frameScript(options: {
     applyTheme(data);
     declaredRead = nameSet(data.readTools);
     declaredWrite = nameSet(data.writeTools);
-    current = { source: typeof data.source === 'string' ? data.source : '', streaming: !!data.streaming };
+    declaredKnown = nameSet(data.knownComponents);
+    current = {
+      source: typeof data.source === 'string' ? data.source : '',
+      streaming: !!data.streaming,
+      customComponents: Array.isArray(data.customComponents) ? data.customComponents : []
+    };
     render();
   });
 

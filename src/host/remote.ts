@@ -43,6 +43,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm/brand'
  */
 
 import type { RemoteCallKind, RemoteJson, ToolCallReply } from '../protocol.ts'
+import type { CustomComponent } from '../registry.ts'
 import { checkResultSize, decideToolCall } from './policy.ts'
 
 /** Deployment limits and allowlists this Remote enforces. */
@@ -55,6 +56,8 @@ export interface OpenUiRemoteOptions {
   readonly maxResultBytes: number
   /** Wall-clock ceiling on one tool call. */
   readonly callTimeoutMs: number
+  /** Read the profile's registered components, for the browser half. */
+  readonly loadComponents: () => Promise<readonly CustomComponent[]>
 }
 
 /** Structural view of the `agents` service; avoids depending on its Context merge. */
@@ -105,6 +108,21 @@ export class OpenUiRemote extends TypertRemoteService<never> {
       query: [...this.options.allowedTools],
       mutation: [...this.options.writableTools],
     }
+  }
+
+  /**
+   * Serve the profile's registered components to the browser half.
+   *
+   * The card expands them before it posts a program into the sandboxed frame, so
+   * what the frame renders is always the built-in catalog. This is a read-only,
+   * profile-wide list: it carries no session data and nothing from the program
+   * being rendered.
+   * @returns the component manifests, as JSON.
+   */
+  @Remote('components')
+  async components(): Promise<{ components: RemoteJson }> {
+    const components = await this.options.loadComponents()
+    return { components: JSON.parse(JSON.stringify(components)) as RemoteJson }
   }
 
   /**

@@ -34,6 +34,7 @@ import {
   FRAME_BOOT,
   FRAME_ERROR,
   FRAME_HEIGHT,
+  FRAME_OK,
   FRAME_READY,
   FRAME_SET,
   FRAME_TOKEN_FIELD,
@@ -43,6 +44,7 @@ import {
 } from '../shell.ts'
 import { formatActionSubmission, type FrameAction } from './conversation.ts'
 import { observeTheme, resolveTheme } from './theme.ts'
+import { expandProgram, type CustomComponent } from '../registry.ts'
 
 /**
  * Hand one card action to the session the card was rendered in. The title
@@ -94,6 +96,22 @@ const errorStyle: CSSProperties = {
   opacity: 1,
   color: 'var(--dsw-alias-state-error-primary, #d33)',
 }
+
+/**
+ * A registered component that could not be expanded. This is a configuration
+ * problem (a template the catalog does not accept), not a program syntax error,
+ * so it is reported separately from the frame's own parse failure.
+ */
+const noticeStyle: CSSProperties = {
+  ...headerStyle,
+  whiteSpace: 'pre-wrap',
+  overflow: 'visible',
+  opacity: 1,
+  color: 'var(--dsw-alias-state-warning-primary, #b26a00)',
+}
+
+/** Stable identity for "no registered components", so memos do not churn. */
+const NO_COMPONENTS: readonly CustomComponent[] = []
 
 const frameStyle: CSSProperties = {
   display: 'block',
@@ -161,11 +179,17 @@ interface FrameChannel {
   /**
    * Publish one program state to the frame. `readTools`/`writeTools` are the
    * host's parse of the program; omit them only where no host parse exists.
+   * `knownComponents` names the registered components the source was expanded
+   * with, so the frame can ignore the transient unknown-component errors it
+   * sees while a registered call is still streaming in. `customComponents`
+   * carries the React definitions the frame's library has to be extended with.
    */
   publish: (
     source: string,
     streaming: boolean,
     tools?: { readTools?: readonly string[]; writeTools?: readonly string[] },
+    knownComponents?: readonly string[],
+    customComponents?: readonly CustomComponent[],
   ) => void
 }
 
@@ -189,6 +213,8 @@ function useFrameChannel(options: {
     streaming: boolean
     readTools?: readonly string[]
     writeTools?: readonly string[]
+    knownComponents?: readonly string[]
+    customComponents?: readonly CustomComponent[]
   }>({ source: '', streaming: false })
   // The listener is attached once per call; reading the sinks through refs keeps
   // it from having to be re-attached whenever a parent re-renders.
@@ -219,6 +245,12 @@ function useFrameChannel(options: {
       streaming: stateRef.current.streaming,
       ...stateRef.current.readTools === undefined ? {} : { readTools: stateRef.current.readTools },
       ...stateRef.current.writeTools === undefined ? {} : { writeTools: stateRef.current.writeTools },
+      ...stateRef.current.knownComponents === undefined
+        ? {}
+        : { knownComponents: stateRef.current.knownComponents },
+      ...stateRef.current.customComponents === undefined
+        ? {}
+        : { customComponents: stateRef.current.customComponents },
       theme: theme.vars,
       scheme: theme.scheme,
     }
@@ -246,6 +278,13 @@ function useFrameChannel(options: {
         case FRAME_ERROR:
           setStatus('failed')
           setError(typeof data['message'] === 'string' ? data['message'] : 'the OpenUI runtime failed to load')
+          break
+        case FRAME_OK:
+          // A later program state parsed cleanly; the earlier finding no longer
+          // describes what is on screen. Deliberately does not re-push: the
+          // frame is already rendering the state it just parsed.
+          setStatus('ready')
+          setError(undefined)
           break
         case FRAME_HEIGHT: {
           const reported = typeof data['height'] === 'number' ? data['height'] : 0
@@ -313,8 +352,16 @@ function useFrameChannel(options: {
     source: string,
     streaming: boolean,
     tools?: { readTools?: readonly string[]; writeTools?: readonly string[] },
+    knownComponents?: readonly string[],
+    customComponents?: readonly CustomComponent[],
   ) => {
-    stateRef.current = { source, streaming, ...tools }
+    stateRef.current = {
+      source,
+      streaming,
+      ...tools,
+      ...knownComponents === undefined ? {} : { knownComponents },
+      ...customComponents === undefined ? {} : { customComponents },
+    }
     push()
   }, [push])
 
@@ -333,11 +380,12 @@ function useFrameChannel(options: {
 const cardStyle: CSSProperties = { minWidth: 0, maxWidth: '100%' }
 
 /** Header line plus the sandboxed frame. */
-function CardView({ frameRef, height, status, error, title, path, doc }: {
+function CardView({ frameRef, height, status, error, notice, title, path, doc }: {
   frameRef: MutableRefObject<HTMLIFrameElement | null>
   height: number
   status: FrameStatus
   error: string | undefined
+  notice?: string | undefined
   title: string
   path: string
   doc: string
@@ -352,6 +400,7 @@ function CardView({ frameRef, height, status, error, title, path, doc }: {
       {/* A frame that never booted must say so: the alternative is a blank box
           with no way to tell a blocked script from an unreachable CDN. */}
       {error !== undefined && <div style={errorStyle}>OpenUI · {error}</div>}
+      {notice !== undefined && <div style={noticeStyle}>OpenUI · {notice}</div>}
       <iframe
         ref={frameRef}
         sandbox="allow-scripts"
@@ -368,11 +417,12 @@ function CardView({ frameRef, height, status, error, title, path, doc }: {
  * A settled, well-formed card.
  * @param props - the descriptor, the call id and the sinks.
  */
-export function OpenUiFrame({ meta, callId, onAction, callTool }: {
+export function OpenUiFrame({ meta, callId, onAction, callTool, components }: {
   meta: OpenUiMeta
   callId: string
   onAction?: ActionHandler | undefined
   callTool?: ToolCallHandler | undefined
+  components?: readonly CustomComponent[] | undefined
 }) {
   const { frameRef, height, status, error, publish } = useFrameChannel({
     callId, mode: meta.mode, onAction, callTool, title: meta.title,
@@ -380,30 +430,60 @@ export function OpenUiFrame({ meta, callId, onAction, callTool }: {
   // The document is built once per call: rebuilding it would remount the frame
   // and re-import the renderer this card is streaming into.
   const doc = useMemo(() => buildFrameDoc({ token: callId, css: FRAME_CSS }), [callId])
+  // The card's own snapshot wins: replay must keep rendering the component
+  // definitions the card was made with, even if the registry changed since.
+  const registry = meta.components ?? components ?? NO_COMPONENTS
+  // Template components are expanded here; React components travel into the
+  // frame, whose library is extended before the Renderer parses the program.
+  const expansion = useMemo(() => expandProgram(meta.source, registry), [meta.source, registry])
+  const known = useMemo(() => registry.map(component => component.name), [registry])
+  const reactComponents = useMemo(
+    () => registry.filter(component => component.kind === 'react'),
+    [registry],
+  )
   useEffect(() => {
-    publish(meta.source, false, { readTools: meta.readTools, writeTools: meta.writeTools })
-  }, [publish, meta.source, meta.readTools, meta.writeTools])
+    publish(
+      expansion.source,
+      false,
+      { readTools: meta.readTools, writeTools: meta.writeTools },
+      known,
+      reactComponents,
+    )
+  }, [publish, expansion.source, known, meta.readTools, meta.writeTools, reactComponents])
+  const notice = expansion.problems.length === 0
+    ? undefined
+    : `registered component: ${expansion.problems.map(problem => problem.message).join(' ')}`
   return (
     <CardView
-      frameRef={frameRef} height={height} status={status} error={error}
+      frameRef={frameRef} height={height} status={status} error={error} notice={notice}
       title={meta.title} path={meta.path} doc={doc}
     />
   )
 }
 
 /** A card that is still streaming, driven by the call's own argument prefix. */
-export function OpenUiStreamingFrame({ source, callId, title, onAction, callTool }: {
+export function OpenUiStreamingFrame({ source, callId, title, onAction, callTool, components }: {
   source: string
   callId: string
   title: string
   onAction?: ActionHandler | undefined
   callTool?: ToolCallHandler | undefined
+  components?: readonly CustomComponent[] | undefined
 }) {
   const { frameRef, height, status, error, publish } = useFrameChannel({
     callId, mode: 'inline', onAction, callTool, title,
   })
   const doc = useMemo(() => buildFrameDoc({ token: callId, css: FRAME_CSS }), [callId])
-  useEffect(() => { publish(source, true) }, [publish, source])
+  const registry = components ?? NO_COMPONENTS
+  const expansion = useMemo(() => expandProgram(source, registry), [source, registry])
+  const known = useMemo(() => registry.map(component => component.name), [registry])
+  const reactComponents = useMemo(
+    () => registry.filter(component => component.kind === 'react'),
+    [registry],
+  )
+  useEffect(() => {
+    publish(expansion.source, true, undefined, known, reactComponents)
+  }, [publish, expansion.source, known, reactComponents])
   return (
     <CardView
       frameRef={frameRef} height={height} status={status} error={error}
@@ -447,8 +527,9 @@ function argsRawOf(block: unknown): unknown {
 export function OpenUiCard(props: ToolCallViewProps & {
   onAction?: ActionHandler | undefined
   callTool?: ToolCallHandler | undefined
+  components?: readonly CustomComponent[] | undefined
 }) {
-  const { callId, block, onAction, callTool } = props
+  const { callId, block, onAction, callTool, components } = props
   const phase = (props as { phase?: string }).phase
   // dsh 0.2 exposes a preparing phase whose block carries no arguments yet; the
   // slot injects this call's own growing argument prefix, and it is empty in
@@ -463,6 +544,7 @@ export function OpenUiCard(props: ToolCallViewProps & {
     return (
       <OpenUiStreamingFrame
         source={source} callId={callId} title="OpenUI" onAction={onAction} callTool={callTool}
+        components={components}
       />
     )
   }
@@ -479,10 +561,15 @@ export function OpenUiCard(props: ToolCallViewProps & {
     return (
       <OpenUiStreamingFrame
         source={meta.source} callId={callId} title={meta.title} onAction={onAction} callTool={callTool}
+        components={components}
       />
     )
   }
-  return <OpenUiFrame meta={meta} callId={callId} onAction={onAction} callTool={callTool} />
+  return (
+    <OpenUiFrame
+      meta={meta} callId={callId} onAction={onAction} callTool={callTool} components={components}
+    />
+  )
 }
 
 /**

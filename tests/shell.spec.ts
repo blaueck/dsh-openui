@@ -10,6 +10,7 @@ import {
   FRAME_ACTION,
   FRAME_CSP,
   FRAME_HEIGHT,
+  FRAME_OK,
   FRAME_READY,
   FRAME_SET,
   FRAME_TOKEN_FIELD,
@@ -23,6 +24,22 @@ import {
 const DOC = buildFrameDoc({ token: 'call-1', css: FRAME_CSS })
 
 describe('buildFrameDoc', () => {
+  it('contains a syntactically valid inline script', () => {
+    // The frame script is assembled as text, so a typo in it would only surface
+    // when a card mounts. Compiling it here keeps that failure in CI.
+    const start = DOC.indexOf('<script>') + '<script>'.length
+    const end = DOC.lastIndexOf('</script>')
+    expect(() => new Function(DOC.slice(start, end))).not.toThrow()
+  })
+
+  it('loads registered React components into the runtime', () => {
+    expect(DOC).toContain('customComponents')
+    expect(DOC).toContain('function libraryFor')
+    expect(DOC).toContain('extend({ components: { add: additions } })')
+    expect(DOC).toContain('__dshOpenUI')
+    expect(DOC).toContain('toAssistant')
+  })
+
   it('mounts into the documented id', () => {
     expect(DOC).toContain(`id="${OPENUI_FRAME_MOUNT_ID}"`)
   })
@@ -119,8 +136,10 @@ describe('buildFrameDoc', () => {
 
   it('ignores an empty error list, which the renderer reports on first paint', () => {
     // Relaying it would print "the program could not be parsed" beneath a card
-    // that in fact rendered every component.
-    expect(DOC).toContain('if (!errors || !errors.length) return;')
+    // that in fact rendered every component. After the first paint the same
+    // empty list means a previous finding is resolved, so it clears that row.
+    expect(DOC).toContain('if (!errors || !errors.length) {')
+    expect(DOC).toContain("if (painted) send('ok', {});")
   })
 })
 
@@ -180,11 +199,13 @@ describe('FRAME_CSS', () => {
 })
 
 describe('card-initiated tool calls', () => {
-  it('names the two extra protocol messages', () => {
+  it('names the extra protocol messages', () => {
     expect(FRAME_TOOLCALL).toBe('toolcall')
     expect(FRAME_TOOLRESULT).toBe('toolresult')
+    expect(FRAME_OK).toBe('ok')
     expect(DOC).toContain("send('toolcall'")
     expect(DOC).toContain("data.type === 'toolresult'")
+    expect(DOC).toContain("send('ok'")
   })
 
   it('gives the renderer a tool provider and the parse hook that attributes calls', () => {

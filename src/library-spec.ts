@@ -11,7 +11,6 @@
  */
 
 import {
-  createParser,
   mergeStatements,
   type LibraryJSONSchema,
   type ParseResult,
@@ -19,6 +18,8 @@ import {
 } from '@openuidev/lang-core'
 import schema from './generated/library.schema.json' with { type: 'json' }
 import meta from './generated/library-meta.json' with { type: 'json' }
+import { expandProgram, type CustomComponent } from './registry.ts'
+import { parserFor, reactComponentsOf, usedReactComponents } from './schema-extension.ts'
 
 /** Provenance and shape of the catalog this build validates against. */
 export interface OpenUiLibraryMeta {
@@ -85,12 +86,13 @@ export interface OpenUiValidation {
   readTools: string[]
   /** Tool names this program mutates, in the order the parser found them. */
   writeTools: string[]
+  /** The program after registered components were expanded; what actually renders. */
+  expandedSource: string
+  /** Registered components this program used, in first-use order. */
+  usedComponents: readonly string[]
   /** Parsed result, for callers that need the tree. */
   result: ParseResult
 }
-
-/** A parser built once per process over the frozen catalog. */
-const parser = createParser(OPENUI_LIBRARY_SCHEMA, OPENUI_LIBRARY_META.root)
 
 /**
  * The literal tool names a program uses, split by statement kind.
@@ -120,12 +122,24 @@ export function programToolUsage(result: ParseResult): { readTools: string[]; wr
 
 /**
  * Validate one OpenUI Lang program against the catalog.
+ *
+ * Registered components are expanded first, so what the parser sees is exactly
+ * what the browser will render: a composition of built-in components. Expansion
+ * findings are fatal here because an unexpanded call would reach the renderer as
+ * an unknown component anyway — reporting the real reason (say, a missing
+ * argument) lets the model fix it in one round trip.
  * @param source - the whole program text.
+ * @param components - the locally registered components.
  * @returns the parse result and the fatal/advisory findings.
  */
-export function validateOpenUi(source: string): OpenUiValidation {
-  const result = parser.parse(source)
-  const problems: OpenUiProblem[] = []
+export function validateOpenUi(source: string, components: readonly CustomComponent[] = []): OpenUiValidation {
+  const expansion = expandProgram(source, components)
+  const parser = parserFor(components)
+  const result = parser.parse(expansion.source)
+  const problems: OpenUiProblem[] = expansion.problems.map(problem => ({
+    code: `registered-${problem.code}`,
+    message: problem.message,
+  }))
   const notes: OpenUiProblem[] = []
 
   if (result.meta.incomplete) {
@@ -172,12 +186,19 @@ export function validateOpenUi(source: string): OpenUiValidation {
     })
   }
 
+  const used = [...expansion.used]
+  for (const name of usedReactComponents(result.root, new Set(reactComponentsOf(components).map(component => component.name)))) {
+    if (!used.includes(name)) used.push(name)
+  }
+
   return {
     problems,
     notes,
     statementCount: result.meta.statementCount,
     rootComponent: result.root?.typeName,
     ...programToolUsage(result),
+    expandedSource: expansion.source,
+    usedComponents: used,
     result,
   }
 }

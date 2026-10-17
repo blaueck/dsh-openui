@@ -9,7 +9,20 @@
  * It also proves the Remote service actually registers, which is the one thing
  * the running session could not tell us while it held an older module.
  */
+import { mkdtemp } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Context } from '@deepseek-ai/cordis'
+
+// Isolate the profile registry: the plugin defaults to the real DSH profile, and
+// a smoke test must not read or write the user's components.
+const componentsDir = await mkdtemp(join(tmpdir(), 'dsh-openui-smoke-'))
+const registryConfig = {
+  customComponents: true,
+  allowCodeComponents: true,
+  componentsDir,
+  maxComponents: 200,
+}
 
 const ctx = new Context()
 const registered = []
@@ -27,16 +40,19 @@ plugin.apply(ctx, {
   writableTools: [],
   maxResultBytes: 256_000,
   callTimeoutMs: 20_000,
+  ...registryConfig,
 })
 
 const remote = ctx.get('openuiRemote')
 const catalog = remote === undefined ? undefined : await remote.catalog()
+const components = remote === undefined ? undefined : await remote.components()
 
 console.log('plugin name       :', plugin.name)
 console.log('tools registered  :', registered.join(', ') || '(none)')
 console.log('skill providers   :', providers.length)
 console.log('openuiRemote      :', remote === undefined ? 'MISSING' : 'registered')
 console.log('remote catalog    :', JSON.stringify(catalog))
+console.log('registered list   :', JSON.stringify(components))
 
 // Exercise the Remote through the Cordis service proxy, which is where the
 // `#private`-field bug showed up: the proxy is the receiver, so only plain
@@ -56,7 +72,7 @@ ctx2.provide('fs', {})
 ctx2.provide('agents', { get: id => (id === 'sess-1' ? agent : undefined) })
 plugin.apply(ctx2, {
   maxSourceBytes: 256_000, allowedTools: ['glob'], writableTools: [],
-  maxResultBytes: 256_000, callTimeoutMs: 20_000,
+  maxResultBytes: 256_000, callTimeoutMs: 20_000, ...registryConfig,
 })
 const live = ctx2.get('openuiRemote')
 const allowed = await live.call('sess-1', 'glob', { pattern: '*.ts' }, 'query')
@@ -71,7 +87,10 @@ console.log('wrong list        :', wrongKind.ok, '|', (wrongKind.error ?? '').sl
 console.log('unknown session   :', gone.ok, '|', gone.error)
 
 const ok = registered.includes('openui')
+  && registered.includes('openui_component')
   && remote !== undefined
+  && Array.isArray(components?.components)
+  && components.components.length === 0
   && catalog?.query?.includes('glob')
   && executed.length === 1
   && allowed.ok === true

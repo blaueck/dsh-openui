@@ -28,10 +28,19 @@ import type { FsTarget } from '@deepseek-ai/dsh-fs'
 // Type-only: pulls the `ctx.get('sandboxPolicy')` Context merge.
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { OPENUI_LIBRARY_META, mergeOpenUi, validateOpenUi, type OpenUiProblem } from './library-spec.ts'
+import type { ComponentStore } from './store.ts'
+import type { CustomComponent } from './registry.ts'
 import { SKILL_BODY_PATH, SKILL_RESOURCE_DIR } from './skill.ts'
 import { OPENUI_TOOL_NAME, type OpenUiAction, type OpenUiMode } from './meta.ts'
 
 export { OPENUI_TOOL_NAME } from './meta.ts'
+
+/**
+ * Local structural copy of the JSON value the meta channel accepts. The package
+ * that owns the canonical type is a transitive dependency of `dsh-tools`, so
+ * naming it here would add a dependency for one cast.
+ */
+type Json = null | string | number | boolean | Json[] | { [key: string]: Json }
 
 const DESCRIPTION =
   'Answer with a live UI instead of prose: render an OpenUI Lang program — the '
@@ -43,6 +52,9 @@ const DESCRIPTION =
   + 'A program is a list of `name = Component(positionalArgs...)` statements, one per '
   + `line, starting with \`${OPENUI_LIBRARY_META.root} = ${OPENUI_LIBRARY_META.rootComponent}([...])\`; `
   + 'arguments are positional and follow catalog order. '
+  + 'This profile may also have locally registered components, which this tool resolves '
+  + 'before rendering; load the `openui-components` skill (when present) for their '
+  + 'signatures and examples. '
   + 'Cards are interactive: `$variables` are reactive, forms validate themselves, '
   + 'and a button whose action is `@ToAssistant("...")` sends that message back to '
   + 'you as a new user turn with the form values. '
@@ -66,9 +78,18 @@ const DESCRIPTION =
  * Build the `openui` tool definition over the composed filesystem seam.
  * @param ctx - registrant context carrying `ctx.fs` for the card copy.
  * @param maxSourceBytes - deployment size ceiling for one program.
+ * @param store - the profile's registered-component registry, when enabled.
+ * @param allowCodeComponents - whether React code components are active. When
+ *   false, code entries stay on disk but are invisible to this tool, to the
+ *   skill, and to the browser half, so disabling the feature really disables it.
  * @returns the tool definition to register on `ctx.tools`.
  */
-export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition {
+export function openUiTool(
+  ctx: Context,
+  maxSourceBytes: number,
+  store?: ComponentStore,
+  allowCodeComponents = false,
+): ToolDefinition {
   return defineTool({
     name: OPENUI_TOOL_NAME,
     description: DESCRIPTION,
@@ -126,6 +147,12 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
           statementCount: { type: 'integer', required: true },
           libraryId: { type: 'string', required: true },
           source: { type: 'string', required: true },
+          // Registered components the program used, resolved before validation.
+          components: { type: 'array', required: true, items: { type: 'string' } },
+          // The same components' definitions, JSON-encoded. Not model-facing (the
+          // render ignores it); it exists so `presentationMeta` can snapshot them
+          // without a second registry read at replay time.
+          customComponentsJson: { type: 'string', required: true },
           // The read/write split the browser half attributes card tool calls
           // with; see {@link OpenUiMeta.readTools}.
           readTools: { type: 'array', required: true, items: { type: 'string' } },
@@ -138,11 +165,14 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
       // correction patches the new card rather than the superseded one.
       render: (_args, value) => {
         const size = `${humanBytes(value.sizeBytes)}, ${value.statementCount} statements`
+        const via = value.components.length === 0
+          ? ''
+          : ` via registered component${value.components.length === 1 ? '' : 's'} ${value.components.join(', ')}`
         return [{
           type: 'text',
           text: value.action === 'update'
-            ? `Patched "${value.title}" in place (${size}; updated card at ${value.path}). The user sees the corrected UI in the conversation; patch that path for any further correction.`
-            : `Rendered "${value.title}" as an OpenUI surface (${size}; copy at ${value.path}). The user sees the interactive UI in the conversation.`,
+            ? `Patched "${value.title}" in place (${size}${via}; updated card at ${value.path}). The user sees the corrected UI in the conversation; patch that path for any further correction.`
+            : `Rendered "${value.title}" as an OpenUI surface (${size}${via}; copy at ${value.path}). The user sees the interactive UI in the conversation.`,
         }]
       },
       // Project the program into persisted meta so the card survives replay: the
@@ -157,6 +187,10 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
         libraryId: value.libraryId,
         readTools: value.readTools,
         writeTools: value.writeTools,
+        // Parsed back to an array by the browser half. Only the components this
+        // card actually used are copied, so an unrelated registration does not
+        // grow every card's meta.
+        components: JSON.parse(value.customComponentsJson) as unknown as Json,
       }),
     },
     // A create writes only a content-addressed card copy; concurrent siblings
@@ -181,6 +215,9 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
         ? required(args.title, 'title', action).trim()
         : args.title?.trim() || 'OpenUI'
       const mode = (args.mode ?? 'inline') as OpenUiMode
+      const components: readonly CustomComponent[] = store === undefined
+        ? []
+        : (await store.load()).components.filter(component => allowCodeComponents || component.kind === 'template')
 
       if (action === 'update') {
         const target = await ctx.fs.resolve(required(args.path, 'path', action), resolveOpts)
@@ -191,7 +228,8 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
           throw new Error(`invalid openui update: the card at ${target.displayPath} is not readable`)
         }
         const merged = mergeOpenUi(existing, required(args.patch, 'patch', action))
-        const { source, sizeBytes, statementCount, readTools, writeTools } = accept(merged, maxSourceBytes)
+        const accepted = accept(merged, maxSourceBytes, components)
+        const { source, sizeBytes, statementCount, readTools, writeTools, usedComponents } = accepted
         // Rewrite that same file rather than deriving a new name, so a second
         // patch in the same reply builds on the first — a fresh path per patch
         // would leave later patches addressing a base already superseded, and
@@ -206,15 +244,19 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
           statementCount,
           libraryId: OPENUI_LIBRARY_META.libraryId,
           source,
+          components: usedComponents,
+          customComponentsJson: accepted.snapshot,
           readTools,
           writeTools,
         }
       }
 
-      const { source, sizeBytes, statementCount, readTools, writeTools } = accept(
+      const accepted = accept(
         required(args.source, 'source', action),
         maxSourceBytes,
+        components,
       )
+      const { source, sizeBytes, statementCount, readTools, writeTools, usedComponents } = accepted
       // A create takes a content-addressed name so re-rendering identical bytes
       // reuses the same card copy.
       const written = await writeCard(
@@ -233,6 +275,8 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
         statementCount,
         libraryId: OPENUI_LIBRARY_META.libraryId,
         source,
+        components: usedComponents,
+        customComponentsJson: accepted.snapshot,
         readTools,
         writeTools,
       }
@@ -260,12 +304,15 @@ export function openUiTool(ctx: Context, maxSourceBytes: number): ToolDefinition
  * @returns the accepted program and its measurements.
  * @throws Error listing every fatal problem, phrased so the model can fix it.
  */
-function accept(source: string, maxSourceBytes: number): {
+function accept(source: string, maxSourceBytes: number, components: readonly CustomComponent[]): {
   source: string
   sizeBytes: number
   statementCount: number
   readTools: string[]
   writeTools: string[]
+  usedComponents: string[]
+  /** JSON definitions of the used components, for the persisted meta snapshot. */
+  snapshot: string
 } {
   const trimmed = source.trim()
   if (trimmed.length === 0) {
@@ -278,16 +325,39 @@ function accept(source: string, maxSourceBytes: number): {
       + 'ceiling. Downsample the data it carries — inline fewer rows, or summarise rather than list.',
     )
   }
-  const { problems, notes, statementCount, readTools, writeTools } = validateOpenUi(source)
+  const { problems, notes, statementCount, readTools, writeTools, usedComponents, expandedSource } = validateOpenUi(source, components)
+  // The persisted program is the model's own text; only the render is expanded.
+  // Still bound the expansion so one pathological call cannot hand the frame a
+  // multi-megabyte program it has to re-parse on every keystroke.
+  const expandedBytes = Buffer.byteLength(expandedSource, 'utf8')
+  if (expandedBytes > maxSourceBytes * 4) {
+    throw new Error(
+      `invalid openui program: registered components expand it to ${humanBytes(expandedBytes)}, `
+      + 'far past the source ceiling. Use fewer registered components, or inline the layout.',
+    )
+  }
   if (problems.length > 0) {
     throw new Error(
       `invalid openui program — ${problems.length} problem${problems.length === 1 ? '' : 's'}:\n`
       + problems.map(problem => `- ${problem.code}: ${problem.message}`).join('\n')
       + noteLine(notes)
-      + `\nThe full grammar and component catalog are in the \`${OPENUI_TOOL_NAME}\` skill.`,
+      + `\nThe full grammar and component catalog are in the \`${OPENUI_TOOL_NAME}\` skill`
+      + (components.length === 0 ? '.' : '; locally registered components are in the `openui-components` skill.'),
     )
   }
-  return { source, sizeBytes, statementCount, readTools, writeTools }
+  const used = [...usedComponents]
+  const usedDefs = components.filter(component => used.includes(component.name))
+  return {
+    source,
+    sizeBytes,
+    statementCount,
+    readTools,
+    writeTools,
+    usedComponents: used,
+    // Snapshot *definitions*, not names: replay must not depend on the registry
+    // still holding the same code a month later.
+    snapshot: JSON.stringify(usedDefs),
+  }
 }
 
 /**

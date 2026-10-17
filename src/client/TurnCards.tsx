@@ -21,6 +21,7 @@ import type { PropsRuntime } from '@deepseek-ai/dsh-client-ui-slots'
 import type {} from '@deepseek-ai/dsh-client-ui-chat/client'
 import { OpenUiFrame, type ActionHandler, type ToolCallHandler } from './OpenUiCard.tsx'
 import { cardsBefore } from './turn-cards.ts'
+import type { CustomComponent } from '../registry.ts'
 
 /**
  * `minmax(0, 1fr)` rather than the implicit `auto` track a bare `display: grid`
@@ -43,10 +44,11 @@ const listStyle: CSSProperties = {
  * @returns the turn's cards, or null when it produced none.
  */
 export function OpenUiTurnCards({
-  turn, seq, onAction, callTool,
+  turn, seq, onAction, callTool, components,
 }: PropsRuntime<'conversation.chat.turnTail'> & {
   onAction?: ActionHandler | undefined
   callTool?: ToolCallHandler | undefined
+  components?: readonly CustomComponent[] | undefined
 }) {
   const cards = cardsBefore(turn, seq)
   if (cards.length === 0) return null
@@ -59,6 +61,7 @@ export function OpenUiTurnCards({
           callId={`turn-tail:${card.callId}`}
           onAction={onAction}
           callTool={callTool}
+          components={components}
         />
       ))}
     </div>

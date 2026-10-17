@@ -9,7 +9,11 @@ sandboxed card in the conversation.
 
 The component catalog is the real one: `openuiChatLibrary`, **84 components**,
 generated into this package at build time so the validator, the bundled skill and
-the browser renderer can never disagree.
+the browser renderer can never disagree. It can also grow at runtime: the
+`openui_component` tool registers a reusable **template** (a parameterized
+composition of the built-in components) or a **React component** (code the card
+frame evaluates and renders), persists it in the DSH profile, and documents it in
+a generated `openui-components` skill that every later session can load.
 
 ```
 root   = Card([header, chart, tbl])
@@ -70,6 +74,7 @@ Three parts, deliberately separated:
 | **Host half** | `src/tool.ts`, `src/library-spec.ts` | Validates the program against the generated catalog with `@openuidev/lang-core`, persists it as meta, writes a content-addressed card copy under the OS temp dir. |
 | **Skill** | `skills/openui-skill.md` | The authoring contract the model loads first: the grammar, the 83-component catalog with positional argument order, and the DSH-specific call rules. Generated from the library itself. |
 | **Browser half** | `src/client/*`, `src/shell.ts` | Registers the `openui` toolview and the turn tail, and renders each program in `<iframe sandbox="allow-scripts">`. |
+| **Extensibility** | `src/registry.ts`, `src/store.ts`, `src/register-tool.ts`, `src/schema-extension.ts` | The `openui_component` tool, the profile registry, template expansion, the extended catalog schema, and the generated incremental skill. |
 
 ### Why the renderer runs in a frame, from one bundled script
 
@@ -81,7 +86,8 @@ injected into the host document.
 
 The frame loads **`@openuidev/browser-bundle`** — a single IIFE the OpenUI authors
 ship for exactly this case, containing React, React-DOM, the renderer and the
-component library. Nothing is bundled into `lib/client.js` (57 kB).
+component library. The renderer is not bundled into `lib/client.js` (about 220 kB
+with the registry and the Remote codecs; the ~3.2 MB runtime stays in the frame).
 
 This is not the obvious choice, and the obvious choice does not work. Loading
 `react`, `react-dom/client`, `@openuidev/react-lang` and `@openuidev/react-ui` as
@@ -110,6 +116,69 @@ what `scripts/gen-library.mjs` generates the validator and skill from, because
 validating against the playground library (root `Stack`) would accept programs
 the browser cannot resolve: `Stack` and `Modal` exist only there.
 
+### Extending the catalog
+
+The shipped 84 components are generated and frozen, but the runtime can be
+extended. `openui_component` writes one manifest per component under the DSH
+profile — `<DSH_PROFILE_DIR>/openui/components/<slug>.json` — and regenerates
+`<DSH_PROFILE_DIR>/openui/openui-components.md`, which the plugin exposes as the
+`openui-components` skill. A new session needs no restart: it lists the skill,
+and the `openui` tool validates against the same registry.
+
+Two kinds of component, because they solve different problems:
+
+- **`template`** — one OpenUI Lang expression over the built-in catalog, with
+  `{{prop}}` holes. It is expanded inline before validation and rendering. This
+  is the cheap kind: no new runtime, no code evaluation, and it cannot do
+  anything a hand-written program could not already do.
+- **`react`** — a JavaScript function expression returning React elements, plus
+  optional CSS. The frame evaluates it, adds it to the library with
+  `openuiChatLibrary.extend({ components: { add } })`, and the Renderer then
+  parses the program with that extended library. This is how the catalog gains
+  genuinely new UI: layout, SVG, styling, local state, custom interactions.
+
+Templates are on by default. **Code components are off by default** and require
+the `allowCodeComponents` config flag; a registration attempt without it fails
+with an explanation.
+
+```text
+# template: a parameterized card header
+name:        FlightCard
+props:       from:string, to:string, depart:string, price:number
+template:    Card([CardHeader({{from}} + " → " + {{to}}, {{depart}}),
+                   TextContent("$" + {{price}}, "large-heavy")])
+example:     root = Card([f])
+             f = FlightCard("SFO", "NRT", "10:30", 640)
+```
+
+```text
+# react: a stat card with its own markup
+name:      StatCard
+props:     label:string, count:number
+code:      (props) => React.createElement("div",
+             { style: { padding: 16, borderRadius: 12,
+                        border: "1px solid var(--openui-border-default)" } },
+             React.createElement("div", { style: { fontSize: 12, opacity: 0.7 } }, props.label),
+             React.createElement("div", { style: { fontSize: 28, fontWeight: 600 } }, props.count))
+css:       /* optional; injected once into the frame */
+```
+
+The code form is deliberately plain JavaScript, not JSX: the frame has no
+compiler, and asking the model to emit `React.createElement` keeps the contract
+honest. `React` (the frame's own React 19) is in scope; hooks work because the
+wrapper invokes the function as a component. The function is called as
+`fn(props, context)`; `context.renderNode(value)` renders a nested catalog
+element, and `window.__dshOpenUI.toAssistant(text)` sends a message back to the
+assistant. It cannot call host tools directly — those still go through the
+program's gated `Query()`/`Mutation()` path.
+
+The host never executes component code. It compiles it with `new Function` (which
+parses without running), builds a JSON Schema from the declared props, and
+validates programs against that schema; the code itself only runs inside the
+frame. Each card also **snapshots the definitions it used** into its persisted
+`presentationMeta`, so replay keeps rendering the same component after the
+registry is edited or the component is removed.
+
 ### Theming
 
 The library ships 228 `--openui-*` tokens whose light and dark halves differ only
@@ -127,10 +196,11 @@ pick dark text while the fallbacks stayed light — white on white.
 
 `script-src` carries `'unsafe-eval'`, and that is load-bearing: the component
 library reaches the frame through `react-syntax-highlighter`, whose `refractor`
-dependency evaluates code at module-init time. Without the allowance the import
-throws an `EvalError` and the card stays blank. The frame is still an opaque
-origin with `default-src 'none'`, no nested frames, no form posts, and exactly
-one reachable network origin.
+dependency evaluates code at module-init time, and it is also what lets a
+registered React component be compiled with `new Function`. Without the
+allowance the import throws an `EvalError` and the card stays blank. The frame is
+still an opaque origin with `default-src 'none'`, no nested frames, no form
+posts, and exactly one reachable network origin.
 
 ## Install
 
@@ -153,6 +223,10 @@ The host half takes effect immediately. The browser half is served at
 | Option | Default | Meaning |
 | :--- | :--- | :--- |
 | `maxSourceBytes` | `256000` | Size ceiling for one program. A larger program is rejected with guidance to downsample the data it inlines. |
+| `customComponents` | `true` | Registers the `openui_component` tool and the local registry. |
+| `allowCodeComponents` | `false` | Allows `react` registrations (model-authored code evaluated in the card frame). When false, existing code components are hidden from the tool, the skill and the registry served to the browser half; cards already in the transcript still replay their snapshotted definitions. Templates keep working. |
+| `componentsDir` | `''` | Registry directory. Empty means the running profile's `openui/components`, resolved from the live HMR profile root and then `DSH_PROFILE_DIR`; a relative path resolves against that root. Pin it explicitly when the host process does not export `DSH_PROFILE_DIR`. |
+| `maxComponents` | `200` | Maximum registrations one profile may hold. |
 
 ## The `openui` tool
 
@@ -169,12 +243,49 @@ A rejected program returns the parser's own findings, each naming the offending
 statement and what to change — with a near-miss suggestion for a mistyped
 component name.
 
+## The `openui_component` tool
+
+| Parameter | Meaning |
+| :--- | :--- |
+| `action` | `register` (default), `update`, `remove`, or `list`. |
+| `name` | PascalCase component name, e.g. `FlightCard`. |
+| `description` | One sentence on when to use it; shown in the generated skill. |
+| `props` | Positional arguments in call order: `{ name, type, required? }`. `type` is `string`, `number`, `boolean`, `json`, `array`, `children`, `component` or `any`. |
+| `template` | Template kind: one OpenUI Lang expression with `{{prop}}` holes. |
+| `code` | React kind: a JavaScript function expression `(props, context) => React element`. Requires `allowCodeComponents`. |
+| `css` | React kind: optional stylesheet injected once into the frame. |
+| `example` | Optional complete program demonstrating the component; validated and shown in the skill. |
+
+A registration is validated before it is written: the name must not collide with
+the catalog or an existing registration, every declared prop must be used, the
+template must expand to a valid program, the code must compile, and the example
+must render. Anything rejected comes back with the offending part named.
+
+## Security of code components
+
+`react` components are model-authored JavaScript, so they are opt-in. They run
+inside the same `<iframe sandbox="allow-scripts">` as every card, at an opaque
+origin: no session, no cookies, no host DOM, no access to the parent page. The
+frame's CSP still allows exactly one network origin (`cdn.jsdelivr.net`) plus
+`https:` images.
+
+Inside the frame, code can render, style, keep local state, and call
+`window.__dshOpenUI.toAssistant(text)` — the same `continue_conversation` step a
+catalog `Button` carries. It can also observe the frame protocol (the per-card
+token rides every parent message), which means it could forge the same card
+actions and card-initiated tool calls any program can make; those still hit the
+host's allowlists and approval policy, and it still cannot reach a host service,
+read a file, or address another session directly. The human-facing risk is
+therefore mostly trust in the UI itself: review the code before enabling it, keep
+`allowCodeComponents` off if you do not, and remember that a registration is a
+visible tool call in the transcript.
+
 ## Development
 
 ```bash
 pnpm gen        # regenerate schema + system prompt + skill from the installed library
 pnpm typecheck  # both halves
-pnpm test       # 44 specs
+pnpm test       # 117 specs
 pnpm build      # tsdown: lib/index.js (ESM) + lib/client.js (browser)
 pnpm check      # all of the above
 ```
@@ -283,6 +394,22 @@ every namespace you read **except** the one you mount yourself.
   absent, so build overlays with `Tabs`/`Accordion` instead.
 - **`EditableTable` edits** are collected into form state and returned only when
   the program pairs them with a submit button.
+- **Registered components belong to the profile, not the project.** Every session
+  in the profile sees them; a different profile or a headless client without the
+  browser half does not. They live under `<DSH_PROFILE_DIR>/openui/`, outside any
+  workspace.
+- **Editing a registration is forward-only.** Existing cards replay from the
+  definitions snapshotted in their own meta, so changing or removing a component
+  does not rewrite the transcript; new cards use the new definition.
+- **Code components are not JSX and cannot import modules.** The value is one
+  function expression; `React` is in scope, hooks work, and external code has to
+  be inlined. They also cannot call host tools — only the program's gated
+  `Query()`/`Mutation()` path can.
+- **The frame's schema borrowing tracks the bundle.** A registered component's
+  prop schema is borrowed from existing catalog components (the bundle exposes no
+  zod or `defineComponent`), so a bundle upgrade that renames those internal
+  shapes would make code components fail to load — visibly, and without taking
+  the built-in catalog down.
 
 ## License
 

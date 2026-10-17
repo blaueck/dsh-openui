@@ -39,6 +39,20 @@ describe('openUiMetaFrom', () => {
     expect(openUiMetaFrom(META)).toEqual(META)
   })
 
+  it('carries the registered-component snapshot through replay', () => {
+    const component = {
+      kind: 'template' as const,
+      name: 'FlightCard',
+      description: 'One flight.',
+      props: [{ name: 'from', type: 'string' as const, required: true }],
+      template: 'Card([CardHeader({{from}})])',
+    }
+    expect(openUiMetaFrom({ ...META, components: [component] })?.components).toEqual([component])
+    // A malformed snapshot is ignored, not fatal: the browser half then falls
+    // back to the registry it fetches.
+    expect(openUiMetaFrom({ ...META, components: 'nope' })?.components).toBeUndefined()
+  })
+
   it('declines a foreign meta shape rather than throwing', () => {
     expect(openUiMetaFrom({ kind: 'visualize', render: 'a2ui' })).toBeUndefined()
     expect(openUiMetaFrom(null)).toBeUndefined()

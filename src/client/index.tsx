@@ -18,7 +18,7 @@
  * @module @blaueck/dsh-openui/client
  */
 
-import { useCallback } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { Context as ClientContext } from '@deepseek-ai/cordis'
 // Type-only: pulls the `ctx.slots` Context merge.
 import type {} from '@deepseek-ai/dsh-client-ui-renderer/client'
@@ -42,6 +42,7 @@ import { sendCardAction, type FrameAction } from './conversation.ts'
 import { turnCardsDefinition } from './turn-cards.ts'
 import type { ToolCallReply } from '../protocol.ts'
 import { OPENUI_TOOL_NAME } from '../meta.ts'
+import { parseRegistryPayload, type CustomComponent } from '../registry.ts'
 
 export const name = '@blaueck/dsh-openui'
 
@@ -72,6 +73,12 @@ interface OpenUiRemoteFace {
     args: unknown,
     kind: 'query' | 'mutation',
   ): Promise<{ ok: true; value: ToolCallReply } | { ok: false; error: { message?: string } }>
+  /**
+   * The profile's registered components. The card expands them before it posts
+   * a program into the frame, so a registry change takes effect on the next card
+   * without rebuilding the client bundle.
+   */
+  components(): Promise<{ ok: true; value: { components: unknown } } | { ok: false; error: { message?: string } }>
 }
 
 /**
@@ -83,6 +90,64 @@ interface OpenUiRemoteFace {
  */
 function sessionIdOf(props: unknown): unknown {
   return typeof props === 'object' && props !== null ? (props as { sessionId?: unknown }).sessionId : undefined
+}
+
+/**
+ * One in-flight registry read, so a turn tail mounting several cards at once
+ * issues one Remote call rather than one per card. There is deliberately no TTL
+ * cache: a card mounts immediately after a registration, and a stale read there
+ * would be the one failure a user is most likely to notice.
+ */
+let registryInflight: Promise<readonly CustomComponent[]> | undefined
+
+/**
+ * Load the profile's registered components through this package's Remote.
+ *
+ * A failure is an empty registry, never a thrown error: the card still renders
+ * built-in components, and a program that uses a registered one will show the
+ * same unknown-component finding it would have shown before the feature existed.
+ * @param resolveRemote - resolves (and if needed mounts) the Remote namespace.
+ * @returns the components, or an empty list.
+ */
+async function loadRegistry(
+  resolveRemote: ReturnType<typeof createRemoteResolver>,
+): Promise<readonly CustomComponent[]> {
+  if (registryInflight !== undefined) return registryInflight
+  registryInflight = (async (): Promise<readonly CustomComponent[]> => {
+    try {
+      const resolved = await resolveRemote()
+      if (resolved.face === undefined) return []
+      const result = await resolved.face.components()
+      if (!result.ok) return []
+      return parseRegistryPayload(result.value) ?? []
+    } catch {
+      return []
+    } finally {
+      registryInflight = undefined
+    }
+  })()
+  return registryInflight
+}
+
+/**
+ * The registry for one card mount.
+ * @param resolveRemote - resolves the Remote namespace.
+ * @returns the components, or an empty list until the read settles.
+ */
+function useComponentRegistry(
+  resolveRemote: ReturnType<typeof createRemoteResolver>,
+): readonly CustomComponent[] {
+  const [components, setComponents] = useState<readonly CustomComponent[]>([])
+  useEffect(() => {
+    let live = true
+    void loadRegistry(resolveRemote).then((loaded) => {
+      if (live) setComponents(loaded)
+    })
+    return () => {
+      live = false
+    }
+  }, [resolveRemote])
+  return components
 }
 
 /**
@@ -239,6 +304,7 @@ export function apply(ctx: ClientContext): void {
       {...props}
       onAction={useActionHandler(ctx, props)}
       callTool={useToolCallHandler(ctx, props, resolveRemote)}
+      components={useComponentRegistry(resolveRemote)}
     />
   )
   const TurnTailEntry = (props: Parameters<typeof OpenUiTurnCards>[0]) => (
@@ -246,6 +312,7 @@ export function apply(ctx: ClientContext): void {
       {...props}
       onAction={useActionHandler(ctx, props)}
       callTool={useToolCallHandler(ctx, props, resolveRemote)}
+      components={useComponentRegistry(resolveRemote)}
     />
   )
 
